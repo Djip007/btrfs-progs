@@ -276,9 +276,14 @@ static int cmd_subvol_delete(int argc, char **argv)
 	char	*dupdname = NULL;
 	char	*dupvname = NULL;
 	char	*path;
+	char *dupcpath = NULL;
 	DIR	*dirstream = NULL;
 	int verbose = 0;
 	int commit_mode = 0;
+	int sync_mode = 0;
+	u64 *ids = NULL;
+	int ids_count = 0;
+	u64 lastid = 0;
 
 	optind = 1;
 	while (1) {
@@ -286,10 +291,12 @@ static int cmd_subvol_delete(int argc, char **argv)
 		static const struct option long_options[] = {
 			{"commit-after", no_argument, NULL, 'c'},  /* commit mode 1 */
 			{"commit-each", no_argument, NULL, 'C'},  /* commit mode 2 */
+			{"sync-after", no_argument, NULL, 's'},  /* sync mode 1 */
+			{"sync-each", no_argument, NULL, 'S'},  /* sync mode 2 */
 			{NULL, 0, NULL, 0}
 		};
 
-		c = getopt_long(argc, argv, "cC", long_options, NULL);
+		c = getopt_long(argc, argv, "cCsS", long_options, NULL);
 		if (c < 0)
 			break;
 
@@ -299,6 +306,12 @@ static int cmd_subvol_delete(int argc, char **argv)
 			break;
 		case 'C':
 			commit_mode = 2;
+			break;
+		case 's':
+			sync_mode = 1;
+			break;
+		case 'S':
+			sync_mode = 2;
 			break;
 		case 'v':
 			verbose++;
@@ -315,6 +328,17 @@ static int cmd_subvol_delete(int argc, char **argv)
 		printf("Transaction commit: %s\n",
 			!commit_mode ? "none (default)" :
 			commit_mode == 1 ? "at the end" : "after each");
+		printf("Sync mode: %s\n",
+			!sync_mode ? "none (default)" :
+			sync_mode == 1 ? "at the end" : "after each");
+	}
+
+	if (sync_mode == 1) {
+		ids = (u64*)malloc(argc * sizeof(u64));
+		if (!ids) {
+			fprintf(stderr, "ERROR: not enough memory\n");
+			return 1;
+		}
 	}
 
 	cnt = optind;
@@ -342,6 +366,7 @@ again:
 		goto out;
 	}
 	dupdname = strdup(cpath);
+	dupcpath = strdup(cpath);
 	dname = dirname(dupdname);
 	dupvname = strdup(cpath);
 	vname = basename(dupvname);
@@ -354,9 +379,30 @@ again:
 		goto out;
 	}
 
-	printf("Delete subvolume (%s): '%s/%s'\n",
+	if (sync_mode) {
+		int subvolfd;
+		DIR *subvoldirstream = NULL;
+
+		subvolfd = open_file_or_dir(dupcpath, &subvoldirstream);
+		ret = lookup_ino_rootid(subvolfd, &lastid);
+		close_file_or_dir(subvolfd, subvoldirstream);
+		if (ret < 0) {
+			ret = 1;
+			goto out;
+		}
+		if (sync_mode == 2) {
+			ids[ids_count] = lastid;
+			ids_count++;
+		}
+	}
+	free(dupcpath);
+
+	printf("Delete subvolume (%s, %s): '%s/%s'\n",
 		commit_mode == 2 || (commit_mode == 1 && cnt + 1 == argc)
-		? "commit" : "no-commit", dname, vname);
+		? "commit" : "no-commit",
+		sync_mode == 2 || (sync_mode == 1 && cnt + 1 == argc)
+		? "sync" : "no-sync",
+		dname, vname);
 	strncpy_null(args.name, vname);
 	res = ioctl(fd, BTRFS_IOC_SNAP_DESTROY, &args);
 	e = errno;
@@ -375,6 +421,14 @@ again:
 				"ERROR: unable to wait for commit after '%s': %s\n",
 				path, strerror(errno));
 			ret = 1;
+			goto out;
+		}
+	}
+	if (sync_mode == 1) {
+		res = wait_for_subvolume_cleaning(fd, 1, &lastid, 1);
+		if (res < 0) {
+			ret = 1;
+			goto out;
 		}
 	}
 
@@ -401,6 +455,9 @@ out:
 			ret = 1;
 		}
 	}
+
+	if (sync_mode == 2 && fd != -1)
+		wait_for_subvolume_cleaning(fd, ids_count, ids, 1);
 	close_file_or_dir(fd, dirstream);
 
 	return ret;
