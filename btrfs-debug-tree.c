@@ -34,7 +34,7 @@
 static int print_usage(int ret)
 {
 	fprintf(stderr, "usage: btrfs-debug-tree [-e] [-d] [-r] [-R] [-u]\n");
-	fprintf(stderr, "                        [-b block_num ] device\n");
+	fprintf(stderr, "                        [-b block_num ] [-f filename] device\n");
 	fprintf(stderr, "\t-e : print detailed extents info\n");
 	fprintf(stderr, "\t-d : print info of btrfs device and root tree dirs"
                     " only\n");
@@ -43,6 +43,7 @@ static int print_usage(int ret)
 	fprintf(stderr, "\t-u : print info of uuid tree only\n");
 	fprintf(stderr, "\t-b block_num : print info of the specified block"
                     " only\n");
+	fprintf(stderr, "\t-f filename : print csum info of the specified file\n");
 	fprintf(stderr,
 		"\t-t tree_id : print only the tree with the given id\n");
 	fprintf(stderr, "%s\n", PACKAGE_STRING);
@@ -81,6 +82,156 @@ static void print_extents(struct btrfs_root *root, struct extent_buffer *eb)
 		print_extents(root, next);
 		free_extent_buffer(next);
 	}
+}
+int cnt=1;
+int btrfs_lookup_csum2(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+		  struct btrfs_path *path, u64 bytenr, int cow,int total_csums,FILE *fp)
+{
+	int ret,i,start_pos=0,j=0;
+	struct btrfs_key file_key;
+	struct btrfs_key found_key;
+	struct btrfs_csum_item *item;
+	struct extent_buffer *leaf;
+	u64 csum_offset = 0;
+	u16 csum_size =
+		btrfs_super_csum_size(root->fs_info->super_copy);
+	int csums_in_item;
+	u32 *tree_csum = NULL;
+	int pending_csums=total_csums;
+
+	file_key.objectid = BTRFS_EXTENT_CSUM_OBJECTID;
+	file_key.offset = bytenr;
+	btrfs_set_key_type(&file_key, BTRFS_EXTENT_CSUM_KEY);
+	ret = btrfs_search_slot(trans, root, &file_key, path, 0, cow);
+	if (ret < 0)
+		goto fail;
+	while(1){
+		leaf = path->nodes[0];
+		if (ret > 0) {
+			ret = 1;
+			if (path->slots[0] == 0)
+				goto fail; 
+			path->slots[0]--;
+			btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+			if (btrfs_key_type(&found_key) != BTRFS_EXTENT_CSUM_KEY){
+				fprintf(stderr,"\nInvalid key found.");
+				goto fail;
+			}
+
+			csum_offset = ((bytenr - found_key.offset) / root->sectorsize ) * csum_size;
+			csums_in_item = btrfs_item_size_nr(leaf, path->slots[0]);
+			csums_in_item /= csum_size;
+			csums_in_item = csums_in_item - ((( bytenr - found_key.offset) /root->sectorsize ) )  ;
+			start_pos=csum_offset;
+		}
+		if (path->slots[0] >= btrfs_header_nritems(leaf)) {
+			if (pending_csums > 0){
+				ret = btrfs_next_leaf(root, path);
+				if (ret == 0)
+				      continue;
+			}
+		}
+		item = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_csum_item);
+		btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+		if (!ret){
+			start_pos=0;
+			csum_offset = (bytenr - found_key.offset) / root->sectorsize;
+			csums_in_item = btrfs_item_size_nr(leaf, path->slots[0]);
+			csums_in_item /= csum_size;
+		}
+		if (csums_in_item > pending_csums){
+			//possibly,some other csums on this item.
+			for(i=0;i<pending_csums;i++,cnt++){
+			read_extent_buffer(leaf, &tree_csum,(unsigned long)item+((i*4)+start_pos), csum_size);
+			fprintf(fp,"%x ",tree_csum);
+			if (cnt % 8 == 0)
+				fprintf(fp,"\n");
+			}
+			pending_csums = 0;
+			return 0;
+		}else{
+			for(i=0;i<csums_in_item;i++,cnt++){
+			read_extent_buffer(leaf, &tree_csum,(unsigned long)item+((i*4)+start_pos), csum_size);
+			fprintf(fp,"%x ",tree_csum);
+			if (cnt % 8 == 0)
+				fprintf(fp,"\n");
+			}
+		}
+		pending_csums -= csums_in_item;
+		ret = 0;
+		if (pending_csums > 0){
+			path->slots[0]++;
+
+		}else
+			return 0; 
+	
+	}
+fail:
+	fprintf(stderr,"btrfs_lookup_csum2 search failed..aborting");
+	if (ret > 0)
+		ret = -ENOENT;
+	return ret;
+}
+
+int btrfs_lookup_extent(struct btrfs_fs_info *info,struct btrfs_path *path,u64 ino,int cow,FILE *fp){
+	struct btrfs_key key;
+	struct btrfs_key found_key;
+	struct btrfs_file_extent_item *fi;
+	struct extent_buffer *leaf;
+	struct btrfs_root *fs_root;
+	int ret=-1,slot;
+	int total_csums=0;
+	u64 bytenr;
+	u64 itemnum=0;
+	struct btrfs_path *path1=NULL;
+
+	fs_root=info->fs_root;
+	key.objectid = ino;
+	key.type = BTRFS_EXTENT_DATA_KEY;
+	key.offset = 0;
+	ret = btrfs_search_slot(NULL,fs_root,&key,path,0,0);
+
+	if(ret < 0)
+		goto error;
+
+	if (ret > 1){
+		fprintf(stderr,"Unable to find the entry");
+		return ret;
+	}
+
+	while(1){
+		leaf = path->nodes[0];
+		slot = path->slots[0];
+		if (slot >=  btrfs_header_nritems(leaf)){
+		       ret = btrfs_next_leaf(fs_root, path);
+			       if (ret == 0)
+				      continue;
+			       if (ret < 0)
+				      goto error;
+		}
+		btrfs_item_key_to_cpu(leaf, &found_key, slot);
+		if (found_key.type != BTRFS_EXTENT_DATA_KEY){
+			btrfs_release_path(path);
+			return -EINVAL;
+		}
+
+		fi = btrfs_item_ptr(leaf, slot,struct btrfs_file_extent_item);
+		bytenr = btrfs_file_extent_disk_bytenr(leaf, fi);
+		total_csums=(btrfs_file_extent_num_bytes(leaf,fi)/1024)/4;
+		path->slots[0]++; //move to next item/slot
+		itemnum++;
+		path1 = btrfs_alloc_path();
+	 	ret = btrfs_lookup_csum2(NULL,info->csum_root, path1, bytenr,0,total_csums,fp);
+		btrfs_release_path(path1);
+		if (ret) {
+			fprintf(stderr,"\n Error: btrfs_lookup_csum");
+			return 1;
+		}
+	}
+
+error:
+	btrfs_release_path(path);
+	return ret;
 }
 
 static void print_old_roots(struct btrfs_super_block *super)
@@ -143,6 +294,12 @@ int main(int ac, char **av)
 	u64 block_only = 0;
 	struct btrfs_root *tree_root_scan;
 	u64 tree_id = 0;
+	int csum_only = 0;
+	struct stat st;
+	char filename[200]={'\0'};
+	char outfile[400]={'\0'};
+	FILE *fp;
+	struct btrfs_path *path1=NULL;
 
 	radix_tree_init();
 
@@ -153,7 +310,7 @@ int main(int ac, char **av)
 			{ NULL, 0, NULL, 0 }
 		};
 
-		c = getopt_long(ac, av, "deb:rRut:", long_options, NULL);
+		c = getopt_long(ac, av, "debf:rRut:", long_options, NULL);
 		if (c < 0)
 			break;
 		switch(c) {
@@ -178,6 +335,10 @@ int main(int ac, char **av)
 				break;
 			case 't':
 				tree_id = arg_strtou64(optarg);
+				break;
+			case 'f':
+			 	csum_only = 1;	
+				strcpy(filename,optarg);
 				break;
 			case GETOPT_VAL_HELP:
 			default:
@@ -206,6 +367,31 @@ int main(int ac, char **av)
 	if (!root) {
 		fprintf(stderr, "unable to open %s\n", av[optind]);
 		exit(1);
+	}
+
+	if (csum_only) {
+	        path1 = btrfs_alloc_path();
+		ret = stat(filename, &st);
+		if (ret < 0)	{
+			fprintf(stderr, "unable to open %s\n",filename);
+			exit(1);
+		}
+
+		if(st.st_size < 1024){
+			fprintf(stderr,"file less than 1KB.abort%lu",(st.st_size ));
+			exit(1);
+		}
+
+		btrfs_init_path(&path);
+		sprintf(outfile,"%s.csumdump",filename);
+		fp = fopen(outfile,"w+");
+		if (NULL == fp) {
+			fprintf(stderr,"Unable to open %s file",outfile);
+			return -1;
+		}
+		ret = btrfs_lookup_extent(info,&path,st.st_ino,0,fp);
+		close(fp);
+		goto close_root;
 	}
 
 	if (block_only) {
